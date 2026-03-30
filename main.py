@@ -3,6 +3,7 @@
 
 import os
 import logging
+import json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from openai import OpenAI
@@ -33,31 +34,50 @@ def chat():
         data = request.json
         user_message = data.get('message', '')
         history = data.get('history', [])
+        context = data.get('context', '')
+        rag_results = data.get('rag_results', [])
         
         if not user_message:
             return jsonify({'error': 'Сообщение не может быть пустым'}), 400
         
-        # Простой системный промпт — вся информация уже в user_message
-        system_prompt = """Ты — Онлайн консультация Сияй. Ты женского пола, тебя зовут Сияй.
+        # Формируем расширенный контекст из RAG результатов
+        rag_context = ''
+        if rag_results and len(rag_results) > 0:
+            rag_context = "\n\n=== ИНФОРМАЦИЯ С САЙТА ===\n"
+            for i, result in enumerate(rag_results):
+                rag_context += f"\n--- СТРАНИЦА {i+1}: {result.get('title', 'Без названия')} ---\n"
+                rag_context += f"URL: {result.get('url', '')}\n"
+                rag_context += f"Содержание: {result.get('content', '')}\n"
+            rag_context += "\n=== КОНЕЦ ИНФОРМАЦИИ ===\n"
+            rag_context += "\nИспользуй ТОЛЬКО эту информацию для ответа. НЕ ВЫДУМЫВАЙ услуги, которых нет в информации.\n"
+        
+        # Системный промпт
+        system_prompt = """Ты — Онлайн консультация Сияй. Ты женского пола, тебя зовут Сияй. Ты работаешь в компании "Сияй".
 
 ПРАВИЛА:
-1. В сообщении пользователя может быть раздел "НАЙДЕННЫЕ СТРАНИЦЫ НА САЙТЕ" с информацией с сайта.
-2. Используй ТОЛЬКО эту информацию для ответа.
-3. Если в информации есть список услуг — перечисли их.
-4. НЕ ВЫДУМЫВАЙ услуги, которых нет в информации.
-5. Всегда обращайся на "Вы".
-6. Отвечай кратко (3-5 предложений)."""
-
+1. Всегда обращайся к пользователю на "Вы".
+2. Отвечай кратко (3-5 предложений).
+3. Используй ТОЛЬКО информацию из раздела "ИНФОРМАЦИЯ С САЙТА".
+4. Если в информации есть услуги — перечисли их.
+5. НЕ ВЫДУМЫВАЙ услуги, которых нет в информации.
+6. Если информации нет — скажи: "Уточните, пожалуйста, вопрос. Полный список услуг представлен на нашем сайте". """
+        
         messages = [
             {"role": "system", "content": system_prompt}
         ]
         
-        # Добавляем историю
-        for msg in history:
+        # Добавляем историю (только последние 10 сообщений)
+        for msg in history[-10:]:
             messages.append(msg)
         
-        # Добавляем текущее сообщение (оно уже содержит найденные страницы)
-        messages.append({"role": "user", "content": user_message})
+        # Формируем сообщение пользователя с контекстом
+        full_message = user_message
+        if rag_context:
+            full_message = user_message + rag_context
+        
+        messages.append({"role": "user", "content": full_message})
+        
+        logger.info(f"Сообщение с контекстом: {full_message[:200]}...")
         
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -66,9 +86,9 @@ def chat():
         )
         
         reply = response.choices[0].message.content
-        logger.info(f"User: {user_message[:100]}... | Bot: {reply[:100]}...")
+        logger.info(f"Ответ: {reply[:100]}...")
         
-        return jsonify({'reply': reply})
+        return jsonify({'response': reply})
     
     except Exception as e:
         logger.error(f"Chat error: {str(e)}")
@@ -77,34 +97,56 @@ def chat():
 @app.route('/chat-with-image', methods=['POST'])
 def chat_with_image():
     try:
-        data = request.json
-        user_text = data.get('text', 'Что на этом изображении?')
-        image_url = data.get('image_url', '')
+        # Поддерживаем как JSON, так и FormData
+        if request.is_json:
+            data = request.json
+            user_text = data.get('text', 'Что на этом изображении?')
+            image_url = data.get('image_url', '')
+            history = data.get('history', [])
+            context = data.get('context', '')
+        else:
+            user_text = request.form.get('text', 'Что на этом изображении?')
+            image_url = request.form.get('image_url', '')
+            history_json = request.form.get('history', '[]')
+            history = json.loads(history_json)
+            context = request.form.get('context', '')
         
         if not image_url:
             return jsonify({'error': 'Не указано изображение'}), 400
         
-        system_prompt = """Ты — Онлайн консультация Сияй, женского пола. Всегда обращайся на "Вы". Отвечай кратко. НЕ ВЫДУМЫВАЙ услуги. Если в переданной информации нет услуги — скажи, что не знаешь."""
+        # Формируем системный промпт
+        system_prompt = """Ты — Онлайн консультация Сияй, женского пола. Всегда обращайся на "Вы". Отвечай кратко. НЕ ВЫДУМЫВАЙ услуги. Если в переданной информации нет услуги — скажи, что не знаешь. Информация о компании: адрес г. Ростов-на-Дону, СЖМ, ул. Каменобродская, 33/22; телефон +7 938 135-28-05; форма записи https://сияйестественно.рф/kontakty-v-rostove/#forma"""
 
+        messages = [
+            {"role": "system", "content": system_prompt}
+        ]
+        
+        # Добавляем историю
+        for msg in history[-10:]:
+            messages.append(msg)
+        
+        # Добавляем контекст если есть
+        if context:
+            messages.append({"role": "system", "content": f"Контекст: {context}"})
+        
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_text},
+                {"type": "image_url", "image_url": {"url": image_url, "detail": "auto"}}
+            ]
+        })
+        
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_text},
-                        {"type": "image_url", "image_url": {"url": image_url, "detail": "auto"}}
-                    ]
-                }
-            ],
+            messages=messages,
             max_tokens=2000,
         )
         
         reply = response.choices[0].message.content
         logger.info(f"Image analyzed: {image_url[:50]}...")
         
-        return jsonify({'reply': reply})
+        return jsonify({'response': reply})
     
     except Exception as e:
         logger.error(f"Image chat error: {str(e)}")
